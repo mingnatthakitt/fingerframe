@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Gesture Camera Window</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #111;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: white;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        #canvas-container {
+            position: relative;
+            /* This safely stretches the working area to the size of your window without breaking JS math */
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: cover; /* Forces the fixed canvas to scale up beautifully to fill the window */
+        }
+
+        video {
+            display: none;
+        }
+
+        /* UI Overlays */
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            align-items: center;
+            padding: 30px;
+            box-sizing: border-box;
+        }
+
+        #status-msg {
+            background: rgba(0, 0, 0, 0.7);
+            padding: 12px 24px;
+            border-radius: 30px;
+            font-size: 1rem;
+            font-weight: 600;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            z-index: 5;
+        }
+
+        #countdown {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 7rem;
+            font-weight: 800;
+            text-shadow: 0px 4px 20px rgba(0,0,0,0.8);
+            display: none;
+            z-index: 5;
+        }
+
+        #shutter-flash {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: white;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.1s ease-out;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output-canvas"></canvas>
+        
+        <div id="ui-layer">
+            <div id="status-msg">Make "L" gesture with BOTH hands</div>
+            <div id="countdown">3</div>
+        </div>
+        <div id="shutter-flash"></div>
+    </div>
+
+<script>
+// =======================================================
+//   👇 ADJUST YOUR CUSTOM COLORS & SETTINGS HERE 👇
+// =======================================================
+const LOCKED_FRAME_COLOR = "white"; // Try "white", "indigo", "#ff0055", "#57f7ef" etc.
+const RUNNING_FRAME_COLOR = "white";  // Border color while framing/tracking your hands
+const FRAME_LINE_WIDTH = 1.5;           // Thickness of your L frame border (in pixels)
+const LOCK_DURATION = 1200;           // Hold gesture time to freeze (1200 = 1.2 seconds)
+// =======================================================
+
+const videoElement = document.getElementById('webcam');
+const canvasElement = document.getElementById('output-canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const statusMsg = document.getElementById('status-msg');
+const countdownEl = document.getElementById('countdown');
+const flashEl = document.getElementById('shutter-flash');
+
+const STATE_TRACKING = 'TRACKING';
+const STATE_LOCKING = 'LOCKING';
+const STATE_COUNTDOWN = 'COUNTDOWN';
+const STATE_CAPTURE = 'CAPTURE';
+let currentState = STATE_TRACKING;
+
+let lockStartTime = null;
+let countdownValue = 3;
+let countdownInterval = null;
+
+let cropRegion = null; 
+let frozenFrameCanvas = null; // Storing the frozen background as a safe, un-scaled canvas secondary element
+
+// Keep the internal resolution fixed to match the camera perfectly
+const ASSUMED_WIDTH = 1280;
+const ASSUMED_HEIGHT = 720;
+canvasElement.width = ASSUMED_WIDTH;
+canvasElement.height = ASSUMED_HEIGHT;
+
+function getDistance(p1, p2) {
+    return Math.hypot(p1.x - p2.x, p1.y - p2.y);
+}
+
+// Relaxed gesture tracking: Just checks if your thumb and index fingers are extended out
+function isL_Gesture(landmarks) {
+    const thumbTip = landmarks[4];
+    const indexTip = landmarks[8];
+    const indexBase = landmarks[5];
+    
+    const isIndexExtended = indexTip.y < landmarks[6].y || Math.abs(indexTip.x - landmarks[6].x) > 0.05;
+    const isThumbExtended = getDistance(thumbTip, indexBase) > 0.13;
+
+    return isIndexExtended && isThumbExtended;
+}
+
+function onResults(results) {
+    if (!results.image) return;
+
+    if (currentState === STATE_TRACKING || currentState === STATE_LOCKING) {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        
+        // Render live camera background (mirrored)
+        canvasCtx.translate(canvasElement.width, 0);
+        canvasCtx.scale(-1, 1);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.restore();
+
+        let lGesturesFound = [];
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length >= 2) {
+            for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                if (isL_Gesture(results.multiHandLandmarks[i])) {
+                    const thumbTip = results.multiHandLandmarks[i][4];
+                    const indexTip = results.multiHandLandmarks[i][8];
+                    
+                    const tX = (1 - thumbTip.x) * canvasElement.width;
+                    const tY = thumbTip.y * canvasElement.height;
+                    const iX = (1 - indexTip.x) * canvasElement.width;
+                    const iY = indexTip.y * canvasElement.height;
+                    
+                    lGesturesFound.push({ x: tX, y: tY }, { x: iX, y: iY });
+                }
+            }
+        }
+
+        if (lGesturesFound.length >= 4) {
+            const xCoords = lGesturesFound.map(p => p.x);
+            const yCoords = lGesturesFound.map(p => p.y);
+            
+            const minX = Math.max(0, Math.min(...xCoords));
+            const maxX = Math.min(canvasElement.width, Math.max(...xCoords));
+            const minY = Math.max(0, Math.min(...yCoords));
+            const maxY = Math.min(canvasElement.height, Math.max(...yCoords));
+            
+            cropRegion = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+
+            if(cropRegion.width > 40 && cropRegion.height > 40) {
+                if (currentState === STATE_TRACKING) {
+                    currentState = STATE_LOCKING;
+                    lockStartTime = Date.now();
+                }
+
+                const elapsed = Date.now() - lockStartTime;
+                const progress = Math.min(elapsed / LOCK_DURATION, 1);
+
+                // Scanning frame outline using your custom tracking color
+                canvasCtx.lineWidth = FRAME_LINE_WIDTH;
+                canvasCtx.strokeStyle = RUNNING_FRAME_COLOR;
+                canvasCtx.globalAlpha = 0.4 + (progress * 0.6);
+                canvasCtx.strokeRect(cropRegion.x, cropRegion.y, cropRegion.width, cropRegion.height);
+                canvasCtx.globalAlpha = 1.0;
+
+                statusMsg.innerText = `HOLD STILL TO LOCK... ${Math.round(progress * 100)}%`;
+
+                if (elapsed >= LOCK_DURATION) {
+                    lockBackgroundAndInitializeFrameB(results.image);
+                }
+            }
+        } else {
+            currentState = STATE_TRACKING;
+            statusMsg.innerText = 'Make "L" gesture with BOTH hands';
+        }
+
+    } else if (currentState === STATE_COUNTDOWN || currentState === STATE_CAPTURE) {
+        // Redraw frozen background frame from the hidden offscreen snapshot canvas
+        if (frozenFrameCanvas) {
+            canvasCtx.drawImage(frozenFrameCanvas, 0, 0);
+        }
+
+        // Draw Live Inner Frame B
+        canvasCtx.save();
+        canvasCtx.beginPath();
+        canvasCtx.rect(cropRegion.x, cropRegion.y, cropRegion.width, cropRegion.height);
+        canvasCtx.clip();
+
+        canvasCtx.translate(canvasElement.width, 0);
+        canvasCtx.scale(-1, 1);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.restore();
+
+        // Draw Locked Custom Color Frame Outline
+        canvasCtx.lineWidth = FRAME_LINE_WIDTH;
+        canvasCtx.strokeStyle = LOCKED_FRAME_COLOR;
+        canvasCtx.strokeRect(cropRegion.x, cropRegion.y, cropRegion.width, cropRegion.height);
+    }
+}
+
+function lockBackgroundAndInitializeFrameB(videoFrame) {
+    currentState = STATE_COUNTDOWN;
+    statusMsg.innerText = "BACKGROUND FROZEN • WINDOW LIVE";
+
+    // Create a hidden temporary canvas to hold the snapshot instead of using strict canvas memory data
+    frozenFrameCanvas = document.createElement('canvas');
+    frozenFrameCanvas.width = canvasElement.width;
+    frozenFrameCanvas.height = canvasElement.height;
+    const tempCtx = frozenFrameCanvas.getContext('2d');
+    
+    tempCtx.translate(frozenFrameCanvas.width, 0);
+    tempCtx.scale(-1, 1);
+    tempCtx.drawImage(videoFrame, 0, 0, frozenFrameCanvas.width, frozenFrameCanvas.height);
+
+    startCountdown();
+}
+
+function startCountdown() {
+    countdownValue = 3;
+    countdownEl.innerText = countdownValue;
+    countdownEl.style.display = 'block';
+
+    countdownInterval = setInterval(() => {
+        countdownValue--;
+        if (countdownValue > 0) {
+            countdownEl.innerText = countdownValue;
+        } else if (countdownValue === 0) {
+            countdownEl.innerText = "📸";
+            triggerShutterFlash();
+        } else {
+            clearInterval(countdownInterval);
+            countdownEl.style.display = 'none';
+            resetToDefault();
+        }
+    }, 1000);
+}
+
+function triggerShutterFlash() {
+    currentState = STATE_CAPTURE;
+    flashEl.style.opacity = '1';
+    
+    setTimeout(() => {
+        flashEl.style.opacity = '0';
+        statusMsg.innerText = "SNAPSHOT CAPTURED!";
+        
+        const dataURL = canvasElement.toDataURL('image/png');
+        const link = document.createElement('a');
+        link.download = `Composition_${Date.now()}.png`;
+        link.href = dataURL;
+        link.click();
+    }, 120);
+}
+
+function resetToDefault() {
+    setTimeout(() => {
+        frozenFrameCanvas = null;
+        cropRegion = null;
+        currentState = STATE_TRACKING;
+        statusMsg.innerText = 'Make "L" gesture with BOTH hands';
+    }, 2000);
+}
+
+const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+
+hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+});
+hands.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => {
+        await hands.send({ image: videoElement });
+    },
+    width: 1280,
+    height: 720
+});
+camera.start();
+</script>
+</body>
+</html>
